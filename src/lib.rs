@@ -1,5 +1,5 @@
 use context::Context;
-use full_moon::ast::Ast;
+use full_moon::ast::{Ast, LastStmt};
 #[cfg(all(feature = "luau", any(feature = "lua52", feature = "lua53")))]
 use full_moon::tokenizer::{Symbol, TokenType};
 use serde::Deserialize;
@@ -447,6 +447,36 @@ pub fn format_ast(
     Ok(ast)
 }
 
+fn parse_expression_fragment(code: &str, syntax: LuaVersion) -> Option<Ast> {
+    let wrapped_code = format!("return\n{}", code);
+    let ast = match full_moon::parse_fallible(&wrapped_code, syntax.into()).into_result() {
+        Ok(ast) => ast,
+        Err(_) => return None,
+    };
+
+    let is_single_expression = match (ast.nodes().stmts().next(), ast.nodes().last_stmt()) {
+        (None, Some(LastStmt::Return(return_stmt))) => return_stmt.returns().len() == 1,
+        _ => false,
+    };
+
+    if is_single_expression {
+        Some(ast)
+    } else {
+        None
+    }
+}
+
+fn unwrap_expression_output(ast: &Ast) -> String {
+    match ast.nodes().last_stmt() {
+        Some(LastStmt::Return(return_stmt)) => format!(
+            "{}{}",
+            return_stmt.returns().iter().next().unwrap(),
+            ast.eof()
+        ),
+        _ => unreachable!("guaranteed by parse_expression_fragment"),
+    }
+}
+
 /// Formats given Lua code
 #[allow(clippy::result_large_err)]
 pub fn format_code(
@@ -458,7 +488,13 @@ pub fn format_code(
     let input_ast = match full_moon::parse_fallible(code, config.syntax.into()).into_result() {
         Ok(ast) => ast,
         Err(error) => {
-            return Err(Error::ParseError(error));
+            return match parse_expression_fragment(code, config.syntax) {
+                Some(ast) => {
+                    let formatted = format_ast(ast, config, None, verify_output)?;
+                    Ok(unwrap_expression_output(&formatted))
+                }
+                None => Err(Error::ParseError(error)),
+            };
         }
     };
 
@@ -493,6 +529,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, "local x = 1\n");
+    }
+
+    #[test]
+    fn test_expression_input() {
+        let output = format_code(
+            "function()   print(\"hi\")   end",
+            Config::default(),
+            None,
+            OutputVerification::Full,
+        )
+        .unwrap();
+        assert_eq!(output, "function()\n\tprint(\"hi\")\nend\n");
     }
 
     #[test]
